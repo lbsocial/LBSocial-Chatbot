@@ -2,175 +2,35 @@ import { getSecret } from "wix-secrets-backend";
 import { fetch } from "wix-fetch";
 import wixChatBackend from "wix-chat-backend";
 import wixData from "wix-data";
+import wixUsersBackend from "wix-users-backend";
 
 const OPENAI_BASE_URL = "https://api.openai.com/v1";
 const COLLECTION_NAME = "ChatThreads";
 
+// 🔐 Load OpenAI API key and assistant ID
 async function getOpenAISecrets() {
-    const apiKey = await getSecret("OPENAI-API-KEY");  
-    const assistantId = await getSecret("OPENAI-ASSISTANT-ID");  
+    const apiKey = await getSecret("OPENAI-API-KEY");
+    const assistantId = await getSecret("OPENAI-ASSISTANT-ID");
     return { apiKey, assistantId };
 }
 
-// Store and Retrieve Thread ID for Each Channel
+// 💾 Save thread ID associated with a channel
 async function saveThreadId(channelId, threadId) {
     await wixData.save(COLLECTION_NAME, { channelId, threadId });
 }
 
+// 📤 Get saved thread ID for a channel
 async function getThreadId(channelId) {
-    const result = await wixData.query(COLLECTION_NAME).eq("channelId", channelId).find();
-    return result.items.length > 0 ? result.items[0].threadId : null;
-}
-
-// **Send Message to OpenAI Assistant with File Search**
-async function sendMessageToAssistant(userMessage, channelId) {
-    const { apiKey, assistantId } = await getOpenAISecrets();
-
-    let threadId = await getThreadId(channelId);
-    
-    if (!threadId) {
-        console.log("🔄 Creating a new thread...");
-        threadId = await createThread(apiKey);
-        await saveThreadId(channelId, threadId);
-    } else {
-        console.log("🔄 Using existing thread:", threadId);
-    }
-
-    // Send user message to OpenAI Assistant
-    await fetch(`${OPENAI_BASE_URL}/threads/${threadId}/messages`, {
-        method: "POST",
-        headers: {
-            "Authorization": `Bearer ${apiKey}`,
-            "Content-Type": "application/json",
-            "OpenAI-Beta": "assistants=v2"
-        },
-        body: JSON.stringify({ role: "user", content: userMessage })
-    });
-
-    // **Start Assistant Processing with File Search Enabled**
-    let runResponse = await fetch(`${OPENAI_BASE_URL}/threads/${threadId}/runs`, {
-        method: "POST",
-        headers: {
-            "Authorization": `Bearer ${apiKey}`,
-            "Content-Type": "application/json",
-            "OpenAI-Beta": "assistants=v2"
-        },
-        body: JSON.stringify({
-            assistant_id: assistantId,
-            tools: [{ type: "file_search" }]  // ✅ Enables file search
-        })
-    });
-
-    let runData = await runResponse.json();
-    console.log("🔴 OpenAI Run Data:", runData);
-
-    if (!runData || !runData.id) {
-        console.error("🚨 OpenAI Run Error:", runData);
-        return "⚠️ Error: Could not start AI response.";
-    }
-
-    let runId = runData.id;
-
-    // **Wait until OpenAI completes processing**
-    let status = "queued";
-    while (status !== "completed") {
-        await new Promise(resolve => setTimeout(resolve, 2000));
-
-        let statusResponse = await fetch(`${OPENAI_BASE_URL}/threads/${threadId}/runs/${runId}`, {
-            method: "GET",
-            headers: {
-                "Authorization": `Bearer ${apiKey}`,
-                "OpenAI-Beta": "assistants=v2"
-            }
-        });
-
-        let statusData = await statusResponse.json();
-        console.log("🔄 OpenAI Status Update:", statusData);
-        
-        if (statusData.status === "failed") {
-            console.error("🚨 OpenAI Processing Error:", statusData);
-            return "⚠️ Error: AI processing failed.";
-        }
-
-        status = statusData.status;
-    }
-
-    // **Retrieve the Latest AI Response**
-    let messagesResponse = await fetch(`${OPENAI_BASE_URL}/threads/${threadId}/messages`, {
-        method: "GET",
-        headers: {
-            "Authorization": `Bearer ${apiKey}`,
-            "OpenAI-Beta": "assistants=v2"
-        }
-    });
-
-    let messagesData = await messagesResponse.json();
-    console.log("🟢 OpenAI Messages:", messagesData);
-
-    if (!messagesData || !messagesData.data || messagesData.data.length === 0) {
-        return "⚠️ No response from AI.";
-    }
-
-    // **Fix: Always pick the latest assistant message based on timestamp**
-    let assistantMessages = messagesData.data
-        .filter(msg => msg.role === "assistant")
-        .sort((a, b) => b.created_at - a.created_at); // Sort messages from newest to oldest
-
-    if (assistantMessages.length === 0) {
-        console.error("🚨 No assistant response found!");
-        return "⚠️ AI response was invalid.";
-    }
-
-    // **Get the most recent assistant response (first in sorted list)**
-    let assistantResponse = assistantMessages[0].content[0].text.value; 
-
-    console.log("🔎 Debug: Assistant Messages List (Sorted):", assistantMessages);
-    console.log("🔎 Debug: Latest AI Response Selected:", assistantResponse);
-
-    if (!assistantResponse || assistantResponse.trim().length === 0) {
-        console.error("🚨 OpenAI sent an empty response!");
-        return "⚠️ AI response was empty.";
-    }
-
-    console.log("🟢 Final Assistant Response:", assistantResponse);
-    return assistantResponse;
-}
-
-// **Handle User Message and Send Response to Wix Chat**
-export async function handleUserMessage(userMessage, channelId) {
     try {
-        // **Step 1: Show "Thinking..." Message**
-        await wixChatBackend.sendMessage({
-            messageText: "🤔 Thinking...",
-            channelId: channelId,
-            sendAsVisitor: false
-        });
-
-        // **Step 2: Get AI Response**
-        let assistantResponse = await sendMessageToAssistant(userMessage, channelId);
-
-        console.log("🟢 Assistant Response:", assistantResponse); 
-        console.log("📤 Debug: Message Wix Chat Will Receive:", assistantResponse);
-
-        if (typeof assistantResponse !== "string" || assistantResponse.trim() === "") {
-            console.error("🚨 Invalid AI response format:", assistantResponse);
-            assistantResponse = "⚠️ AI response was invalid.";
-        }
-
-        // **Step 3: Send AI Response as a New Message**
-        console.log("📤 Sending to Wix Chat:", assistantResponse);
-        await wixChatBackend.sendMessage({
-            messageText: assistantResponse,
-            channelId: channelId,
-            sendAsVisitor: false
-        });
-
-    } catch (error) {
-        console.error("🚨 Error processing message:", error);
+        const result = await wixData.query(COLLECTION_NAME).eq("channelId", channelId).find();
+        return result.items.length > 0 ? result.items[0].threadId : null;
+    } catch (e) {
+        console.error("❌ Error querying thread ID:", e);
+        return null;
     }
 }
 
-// **Create a New OpenAI Thread**
+// 🧠 Create a new thread in OpenAI
 async function createThread(apiKey) {
     const response = await fetch(`${OPENAI_BASE_URL}/threads`, {
         method: "POST",
@@ -183,4 +43,133 @@ async function createThread(apiKey) {
 
     const data = await response.json();
     return data.id;
+}
+
+// 💬 Send user message to OpenAI Assistant
+async function sendMessageToAssistant(userMessage, channelId) {
+    const { apiKey, assistantId } = await getOpenAISecrets();
+
+    let threadId = await getThreadId(channelId);
+    if (!threadId) {
+        threadId = await createThread(apiKey);
+        await saveThreadId(channelId, threadId);
+    }
+
+    // Step 1: Send user message to the thread
+    await fetch(`${OPENAI_BASE_URL}/threads/${threadId}/messages`, {
+        method: "POST",
+        headers: {
+            "Authorization": `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+            "OpenAI-Beta": "assistants=v2"
+        },
+        body: JSON.stringify({ role: "user", content: userMessage })
+    });
+
+    // Step 2: Start a run (includes file search)
+    let runResponse = await fetch(`${OPENAI_BASE_URL}/threads/${threadId}/runs`, {
+        method: "POST",
+        headers: {
+            "Authorization": `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+            "OpenAI-Beta": "assistants=v2"
+        },
+        body: JSON.stringify({
+            assistant_id: assistantId,
+            tools: [{ type: "file_search" }]
+        })
+    });
+
+    const runData = await runResponse.json();
+    if (!runData || !runData.id) {
+        console.error("🚨 Run creation failed:", runData);
+        return "⚠️ Error: Could not start AI response.";
+    }
+
+    // Step 3: Poll for completion
+    let runId = runData.id;
+    let status = "queued";
+
+    while (status !== "completed") {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        const statusResponse = await fetch(`${OPENAI_BASE_URL}/threads/${threadId}/runs/${runId}`, {
+            method: "GET",
+            headers: {
+                "Authorization": `Bearer ${apiKey}`,
+                "OpenAI-Beta": "assistants=v2"
+            }
+        });
+
+        const statusData = await statusResponse.json();
+
+        if (statusData.status === "failed") {
+            console.error("🚨 Assistant run failed:", statusData);
+            return "⚠️ AI processing failed.";
+        }
+
+        status = statusData.status;
+    }
+
+    // Step 4: Get the assistant's response
+    const messagesResponse = await fetch(`${OPENAI_BASE_URL}/threads/${threadId}/messages`, {
+        method: "GET",
+        headers: {
+            "Authorization": `Bearer ${apiKey}`,
+            "OpenAI-Beta": "assistants=v2"
+        }
+    });
+
+    const messagesData = await messagesResponse.json();
+
+    const assistantMessages = messagesData.data
+        .filter(msg => msg.role === "assistant")
+        .sort((a, b) => b.created_at - a.created_at);
+
+    if (assistantMessages.length === 0) {
+        return "⚠️ No valid assistant response.";
+    }
+
+    const assistantResponse = assistantMessages[0].content[0].text.value;
+    return assistantResponse || "⚠️ AI response was empty.";
+}
+
+// 🚀 Main handler: respond to user messages
+export async function handleUserMessage(userMessage, channelId) {
+    const user = wixUsersBackend.currentUser;
+
+    if (!user.loggedIn) {
+        console.warn("🚫 Unauthenticated user attempted to message.");
+        return;
+    }
+
+    // Step 1: Show thinking indicator
+    await wixChatBackend.sendMessage({
+        messageText: "🤔 Thinking...",
+        channelId: channelId,
+        sendAsVisitor: false
+    });
+
+    // Step 2: Get AI response
+    let assistantResponse = await sendMessageToAssistant(userMessage, channelId);
+
+    if (typeof assistantResponse !== "string" || assistantResponse.trim() === "") {
+        assistantResponse = "⚠️ AI response was invalid.";
+    }
+
+    // Step 3: Send response to Wix Chat
+    await wixChatBackend.sendMessage({
+        messageText: assistantResponse,
+        channelId: channelId,
+        sendAsVisitor: false
+    });
+}
+
+// ⚠️ Fallback warning for unauthenticated users
+export async function sendBotWarningMessage(channelId) {
+    await wixChatBackend.sendMessage({
+        messageText: "⚠️ You need to be logged in to chat with our assistant.",
+        channelId: channelId,
+        sendAsVisitor: false
+    });
 }
